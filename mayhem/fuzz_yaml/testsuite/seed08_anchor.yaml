@@ -1,0 +1,6 @@
+base: &base
+  name: foo
+  size: 1
+derived:
+  <<: *base
+  size: 2

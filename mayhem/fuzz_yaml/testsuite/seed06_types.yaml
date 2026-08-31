@@ -1,0 +1,6 @@
+str: simple string
+num: 42
+flt: 3.14
+bool_t: true
+bool_f: false
+nothing: null

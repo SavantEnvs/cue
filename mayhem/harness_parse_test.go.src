@@ -1,0 +1,142 @@
+//go:build go1.18
+
+// mayhem harness — CUE language parser + formatter + literal decoder.
+//
+// Fuzzes cuelang.org/go/cue/parser.ParseFile / ParseExpr, cuelang.org/go/cue/format
+// (the pretty-printer, driven off the parsed AST), cuelang.org/go/cue/ast +
+// cuelang.org/go/cue/ast/astutil (tree walk/rewrite), and cuelang.org/go/cue/literal
+// (number/string-literal decoding) — the pure, file-I/O-free "compile CUE source
+// text" entry point cited in the port brief.
+//
+// WHY A COPY INSTEAD OF BUILDING UPSTREAM'S OWN FuzzStandaloneCUE (cue/fuzz_test.go)
+// DIRECTLY: that test lives in cuelang.org/go/cue, a directory that mixes internal
+// (`package cue`) and external (`package cue_test`) test files — go-118-fuzz-build's
+// package loader cannot load a directory like that ("found packages cue and
+// cue_test"). So this harness is staged into its own single-file package
+// (mayhem/build.sh copies it into `_mayhem_harness/fuzz_parse/`, a directory that
+// exists ONLY for this build) and reaches CUE purely through the public API — the
+// exact same surface upstream's own fuzz test exercises, just relocated. No upstream
+// file is modified.
+//
+// This file is committed as `.go.src` (a non-.go name) so go build/go test never see
+// it as an ordinary package file; mayhem/build.sh copies it into place only for the
+// go-118-fuzz-build step. Takes bytes only from the fuzzer, does NO file I/O.
+package fuzzparse
+
+import (
+	"testing"
+
+	"cuelang.org/go/cue/ast"
+	"cuelang.org/go/cue/ast/astutil"
+	"cuelang.org/go/cue/format"
+	"cuelang.org/go/cue/literal"
+	"cuelang.org/go/cue/parser"
+	"cuelang.org/go/cue/token"
+)
+
+func FuzzMayhemParse(f *testing.F) {
+	// A wide sample of supported syntax, lifted from upstream's own
+	// cue/fuzz_test.go FuzzStandaloneCUE seed corpus (same shapes, same intent:
+	// exercise imports, comprehensions, string/byte literals incl. multiline and
+	// interpolated forms, numeric literal suffixes, definitions/optional/required
+	// fields, disjunctions, comparisons, experiments, and error-recovery paths).
+	f.Add([]byte(`package p`))
+	f.Add([]byte(`import "list"
+
+list.Concat(["foo"], [])
+`))
+	f.Add([]byte(`"some string"`))
+	f.Add([]byte(`[1, 2.3, 4M, 5Gi, 1E6, 1.e+0, .23E-10]`))
+	f.Add([]byte(`if foo { if bar if baz { x } }`))
+	f.Add([]byte(`[x for x in [a, b, c]]`))
+	f.Add([]byte(`foo: "bar ": (baz): "\(x)": y`))
+	f.Add([]byte(`{x: _, y: _|_}`))
+	f.Add([]byte(`string | *"foo"`))
+	f.Add([]byte(`[1+1, 2-2, 3*3, 4/4]`))
+	f.Add([]byte(`[1>1, 2>=2, 3==3, 4!=4]`))
+	f.Add([]byte(`[X=string]: Y={}`))
+	f.Add([]byte(`{regular: x, required!: x, optional?: x}`))
+	f.Add([]byte(`["日本\U00008a9e", '\xff\003']`))
+	f.Add([]byte(`"""
+here is a multiline
+string literal
+"""`))
+	f.Add([]byte(`["\(expr)", #"\#(expr) \(notexpr)"#]`))
+	f.Add([]byte(`a[0], b["foo"], #c.#bar, _d._baz`))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// Keep single-exec cost bounded (parsing is fast and allocation scales with
+		// input size, but a coverage-guided fuzzer can still generate very large
+		// inputs) without artificially starving coverage the way upstream's
+		// len(s) > 100 skip would under Mayhem's much larger per-run budget.
+		if len(data) > 1<<16 {
+			t.Skip()
+		}
+		s := string(data)
+
+		f, err := parser.ParseFile("fuzz.cue", s, parser.ParseComments)
+		// Check ParseExpr too. A valid file is not always a valid expression, but
+		// ParseExpr must still never panic.
+		_, exprErr := parser.ParseExpr("fuzz.cue", s, parser.ParseComments)
+		if err != nil {
+			// Per the spec, "package" and "import" are valid identifiers after the
+			// preamble, so ParseExpr and IsValidIdent correctly accept them even
+			// though ParseFile (which expects a full file) does not.
+			if s != "package" && s != "import" {
+				if exprErr == nil {
+					t.Errorf("ParseFile rejects this input but ParseExpr does not: %q", s)
+				}
+				if ast.IsValidIdent(s) {
+					t.Errorf("cue/parser rejects this identifier but cue/ast accepts it as valid: %q", s)
+				}
+			}
+			var info literal.NumInfo
+			if err := literal.ParseNum(s, &info); err == nil {
+				t.Errorf("cue/parser rejects this number but cue/literal accepts it as valid: %q", s)
+			}
+			if _, err := literal.Unquote(s); err == nil {
+				t.Errorf("cue/parser rejects this string but cue/literal accepts it as valid: %q", s)
+			}
+			return
+		}
+
+		// Common operations with the syntax tree: formatting, walking, rewriting.
+		if _, err := format.Node(f); err != nil {
+			t.Errorf("cue/format should not fail on parsed input: %v", err)
+		}
+		ast.Walk(f,
+			func(ast.Node) bool { return true },
+			func(ast.Node) {},
+		)
+		astutil.Apply(f,
+			func(c astutil.Cursor) bool {
+				node := c.Node()
+				_ = node.Pos().Position()
+				_ = node.End().Position()
+				switch node := node.(type) {
+				case *ast.Ident:
+					if !ast.IsValidIdent(node.Name) {
+						t.Errorf("cue/parser accepts this identifier as valid but cue/ast does not: %q", node.Name)
+					}
+				case *ast.BasicLit:
+					switch node.Kind {
+					case token.INT, token.FLOAT:
+						var info literal.NumInfo
+						if err := literal.ParseNum(node.Value, &info); err != nil {
+							t.Errorf("cue/parser accepts this number as valid but cue/literal does not: %q", node.Value)
+						}
+					case token.STRING:
+						if _, ok := c.Parent().Node().(*ast.Interpolation); ok {
+							break
+						}
+						if _, err := literal.Unquote(node.Value); err != nil {
+							t.Errorf("cue/parser accepts this string as valid but cue/literal does not: %q", node.Value)
+						}
+					}
+				}
+				return true
+			},
+			func(astutil.Cursor) bool { return true },
+		)
+	})
+}
