@@ -1,0 +1,12 @@
+project: savantenvs/cue
+target: fuzz_yaml
+testsuite:
+  - https://$MAYHEM_DOMAIN/$MAYHEM_PROJECT/$MAYHEM_TARGET/testsuite.tar
+  - file://mayhem/fuzz_yaml/testsuite
+cmds:
+  - cmd: /mayhem/fuzz_yaml
+    libfuzzer: true
+    dictionary: /mayhem/mayhem/fuzz_yaml/fuzz_yaml.dict
+    timeout: 30
+    env:
+      MFUZZ_COMPAT_LEVEL: '2'
