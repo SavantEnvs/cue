@@ -1,0 +1,69 @@
+//go:build go1.18
+
+// mayhem harness — YAML-to-CUE extraction (cuelang.org/go/encoding/yaml).
+//
+// Fuzzes encoding/yaml.Extract: the goccy/go-yaml-backed YAML parser plus CUE's own
+// AST-composition layer (internal/encoding/yaml + internal/encoding/yaml/goccy) that
+// turns a YAML document (or stream of documents) into a CUE ast.Expr/ast.File. This
+// is a second, independent parsing subsystem from fuzz_parse (different lexer,
+// different grammar, different composer), reached purely through the public API.
+//
+// FILE I/O: Extract(filename, src) reads from `src` directly when src != nil (see
+// internal/source.ReadAll) — passing a []byte never touches the filesystem, so this
+// harness (like fuzz_parse) takes bytes only from the fuzzer.
+//
+// Staged the same way as fuzz_parse and for the same reason: a fresh single-file
+// package directory reached only via the public API, copied into place by
+// mayhem/build.sh, never colliding with any upstream package (encoding/yaml also
+// mixes internal/external test files in its own directory).
+package fuzzyaml
+
+import (
+	"testing"
+
+	"cuelang.org/go/cue/ast"
+	"cuelang.org/go/cue/format"
+	"cuelang.org/go/encoding/yaml"
+)
+
+func FuzzMayhemYAML(f *testing.F) {
+	f.Add([]byte("a: foo\nb: bar\n"))
+	f.Add([]byte("[1, 2, 3]\n"))
+	f.Add([]byte("{\"key\": \"value\"}\n"))
+	f.Add([]byte("simple string\n"))
+	f.Add([]byte("42\n"))
+	f.Add([]byte("true\n"))
+	f.Add([]byte("null\n"))
+	f.Add([]byte("a: foo\nb:\n  c: bar\n  d: baz\n"))
+	f.Add([]byte("---\na: 1\n---\nb: 2\n"))
+	f.Add([]byte("list:\n  - one\n  - two\n  - three\n"))
+	f.Add([]byte("anchor: &a foo\nuse: *a\n"))
+	f.Add([]byte("multiline: |\n  line one\n  line two\n"))
+	f.Add([]byte(""))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 1<<16 {
+			t.Skip()
+		}
+
+		expr, err := yaml.Extract("fuzz.yaml", data)
+		if err != nil {
+			// Malformed YAML is an expected outcome, not a finding.
+			return
+		}
+		if expr == nil {
+			return
+		}
+
+		// Drive the formatter and a full tree walk over whatever was extracted —
+		// this is where AST-composition bugs (goccy.ComposeFile) and formatter bugs
+		// on YAML-derived (as opposed to CUE-source-derived) ASTs would surface.
+		if _, err := format.Node(expr); err != nil {
+			t.Errorf("cue/format should not fail on a YAML-derived AST: %v", err)
+		}
+		ast.Walk(expr,
+			func(ast.Node) bool { return true },
+			func(ast.Node) {},
+		)
+	})
+}
