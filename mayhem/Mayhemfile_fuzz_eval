@@ -1,0 +1,12 @@
+project: savantenvs/cue
+target: fuzz_eval-mined-4a67df9
+testsuite:
+  - https://$MAYHEM_DOMAIN/$MAYHEM_PROJECT/$MAYHEM_TARGET/testsuite.tar
+  - file://mayhem/fuzz_eval-mined-4a67df9/testsuite
+cmds:
+  - cmd: /mayhem/fuzz_eval
+    libfuzzer: true
+    dictionary: /mayhem/mayhem/fuzz_eval-mined-4a67df9/fuzz_eval.dict
+    timeout: 30
+    env:
+      MFUZZ_COMPAT_LEVEL: '2'
