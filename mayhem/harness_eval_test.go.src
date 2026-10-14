@@ -1,0 +1,77 @@
+//go:build go1.18
+
+// mayhem harness — CUE compiler + evaluator + Value.Path/Dereference.
+//
+// Compiles fuzzer bytes as a CUE file with cuecontext, then walks every value of the
+// evaluated tree (fields incl. definitions/hidden/optional, list elements) and, for each,
+// calls Value.Path on the value and on cue.Dereference of it. Dereference may hand back a
+// vertex that is not a regular field (e.g. a let binding), whose path Value.Path must
+// still be able to compute.
+//
+// Staged into its own single-file package by mayhem/build.sh (cue/ mixes `package cue`
+// and `package cue_test` files, which go-118-fuzz-build cannot load). Committed as
+// `.go.src` so go build/go test never see it. Takes bytes only from the fuzzer, no file I/O.
+package fuzzeval
+
+import (
+	"testing"
+
+	"cuelang.org/go/cue"
+	"cuelang.org/go/cue/cuecontext"
+)
+
+func FuzzMayhemEval(f *testing.F) {
+	f.Add([]byte("a: 1\nb: a + 1\n"))
+	f.Add([]byte("let x = 1\ny: x + 1\n"))
+	f.Add([]byte("let x = c\nc: 5\nd: x + 1\n"))
+	f.Add([]byte("a: {b: {c: 1}}\nd: a.b.c\n"))
+	f.Add([]byte("#D: {x: int}\nv: #D & {x: 2}\n_h: 3\n"))
+	f.Add([]byte("l: [1, 2, {c: 3}]\nm: l[2]\n"))
+	f.Add([]byte("o?: int\nr!: string\n[string]: int\n"))
+	f.Add([]byte("s: {let t = \"v\", u: t + \"w\"}\n"))
+	f.Add([]byte("x: y\ny: z\nz: 1\n"))
+	f.Add([]byte("a: 1 | 2 | *3\nb: a & 3\n"))
+	f.Add([]byte("c: [for i in [1, 2, 3] if i > 1 {i * 2}]\n"))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 1<<12 {
+			t.Skip()
+		}
+		ctx := cuecontext.New()
+		root := ctx.CompileBytes(data, cue.Filename("fuzz.cue"))
+		if root.Err() != nil {
+			return
+		}
+
+		budget := 512
+		var walk func(v cue.Value, depth int)
+		walk = func(v cue.Value, depth int) {
+			if budget <= 0 || depth > 12 {
+				return
+			}
+			budget--
+			_ = v.Path()
+			_ = cue.Dereference(v).Path()
+
+			switch v.IncompleteKind() {
+			case cue.StructKind:
+				it, err := v.Fields(cue.All())
+				if err != nil {
+					return
+				}
+				for it.Next() {
+					walk(it.Value(), depth+1)
+				}
+			case cue.ListKind:
+				it, err := v.List()
+				if err != nil {
+					return
+				}
+				for it.Next() {
+					walk(it.Value(), depth+1)
+				}
+			}
+		}
+		walk(root, 0)
+	})
+}
